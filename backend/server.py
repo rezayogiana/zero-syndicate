@@ -1,6 +1,6 @@
 """ZERO SYNDICATE API. Run: uvicorn server:app --host 127.0.0.1 --port 8000"""
 from __future__ import annotations
-import base64, csv, io, json, math, os, re, threading, time
+import base64, csv, io, json, math, os, re, threading, time, asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +10,7 @@ import swisseph as swe
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title='ZERO SYNDICATE Market Desk', version='4.0')
+app = FastAPI(title='ZERO SYNDICATE Market Desk', version='4.0.1')
 _rate_guard = {}  # best-effort process-local public API guard; not a substitute for Cloudflare rate limiting
 NAMES = [
  ('Sun','☉',swe.SUN), ('Moon','☽',swe.MOON), ('Mercury','☿',swe.MERCURY),
@@ -31,7 +31,7 @@ _cache_lock = threading.Lock()
 def api_home(): return {'service': 'ZERO SYNDICATE API', 'health': '/api/health'}
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'version':'4.0', 'astro_engine': 'Swiss Ephemeris / Moshier', 'calendar_cache_seconds': 900, 'analyst_model_configured': bool(os.getenv('GEMINI_API_KEY') or os.getenv('CHAT_API_KEY') or os.getenv('OPENAI_API_KEY')), 'calendar_source':'Forex Factory weekly public export; availability not guaranteed', 'xau_price_configured':bool(os.getenv('OANDA_API_TOKEN'))}
+def health(): return {'ok': True, 'version':'4.0.1', 'astro_engine': 'Swiss Ephemeris / Moshier', 'calendar_cache_seconds': 900, 'analyst_model_configured': bool(os.getenv('GEMINI_API_KEY') or os.getenv('CHAT_API_KEY') or os.getenv('OPENAI_API_KEY')), 'calendar_source':'Forex Factory weekly public export; availability not guaranteed', 'xau_price_configured':bool(os.getenv('OANDA_API_TOKEN'))}
 
 def wrap_delta(a,b): return abs((a-b+180)%360-180)
 
@@ -301,8 +301,24 @@ async def analyst(request: Request, question: str=Form(''), instrument: str=Form
     if date:
         try:
             astro_data=astro(date,clock,tz,lat,lon,houses)
-            news=calendar(date,tz)['events']
-        except Exception: pass
+        except Exception:
+            astro_data=None
+        # Penting: jangan download 2 feed (bisa 16 detik) untuk setiap
+        # pertanyaan biasa. Pakai cache yang sudah tersedia; feed live
+        # dipakai hanya saat diminta eksplisit.
+        need_news=any(k in question.lower() for k in ('news','nfp','cpi','fomc','kalender','rilis','fundamental'))
+        try:
+            if need_news:
+                await asyncio.to_thread(calendar_raw)
+            with _cache_lock:
+                cached_events=list(_cache['events'])
+            zone=ZoneInfo(tz)
+            target_day=datetime.strptime(date,'%Y-%m-%d').date()
+            news=[{**ev,'time_local':datetime.fromisoformat(ev['at']).astimezone(zone).strftime('%H:%M')}
+                  for ev in cached_events
+                  if datetime.fromisoformat(ev['at']).astimezone(zone).date()==target_day][:40]
+        except Exception:
+            news=[]
     baseline=basic_answer(question, artifact, astro_data,news)
     gemini_key=os.getenv('GEMINI_API_KEY')
     api_key=os.getenv('CHAT_API_KEY') or os.getenv('OPENAI_API_KEY')
@@ -310,7 +326,7 @@ async def analyst(request: Request, question: str=Form(''), instrument: str=Form
     model=os.getenv('CHAT_MODEL','gpt-4.1-mini')
     if not api_key and not gemini_key:
         if image_data: baseline += '\n\nAnalisis foto belum aktif: atur GEMINI_API_KEY atau CHAT_API_KEY pada server.'
-        return {'reply':baseline, 'mode':'aturan lokal','file':filename or None,'news_count':len(news)}
+        return {'reply':baseline, 'mode':'jawaban dasar','file':filename or None,'news_count':len(news)}
     system=('Anda adalah NARA dari ZERO SYNDICATE. Gaya bicaramu rapi, ringkas, dan terdengar seperti desk analis manusia. Jangan memakai kata AI atau sistem dalam jawaban. Jangan mengaku sebagai manusia. '
             'Jawab dalam Bahasa Indonesia, berbasis data. Jangan mengarang harga, news, sumber, atau win rate. '
             'Jangan menjanjikan akurasi tinggi atau hasil pasti. Astrologi tidak tervalidasi memprediksi pasar; '
@@ -322,28 +338,52 @@ async def analyst(request: Request, question: str=Form(''), instrument: str=Form
     if image_data: user_content.append({'type':'image_url','image_url':{'url':f'data:{mime};base64,{image_data}'}})
     try:
         if gemini_key:
-            model_id=os.getenv('GEMINI_MODEL','gemini-2.5-flash')
+            model_id=os.getenv('GEMINI_MODEL','gemini-3.5-flash-lite')
             if not re.fullmatch(r'[a-zA-Z0-9_.\-]+',model_id): raise ValueError('GEMINI_MODEL tidak valid')
             prompt=context+'\n\nPERTANYAAN PENGGUNA: '+(question or 'Tolong analisis data yang dilampirkan')
             parts=[{'text':prompt}]
             if image_data: parts.append({'inline_data':{'mime_type':mime,'data':image_data}})
-            gemini_res=requests.post('https://generativelanguage.googleapis.com/v1beta/models/'+model_id+':generateContent',
+            gemini_res=await asyncio.to_thread(
+                requests.post,
+                'https://generativelanguage.googleapis.com/v1beta/models/'+model_id+':generateContent',
                 headers={'x-goog-api-key':gemini_key,'Content-Type':'application/json'},
                 json={'system_instruction':{'parts':[{'text':system}]},'contents':[{'role':'user','parts':parts}],
-                'generationConfig':{'temperature':0.2,'maxOutputTokens':1300}},timeout=40)
-            gemini_res.raise_for_status()
+                      'generationConfig':{'temperature':0.2,'maxOutputTokens':1300}},timeout=35)
+            if not gemini_res.ok:
+                # Jangan kirim pesan mentah dari Google karena bisa berisi
+                # metadata sensitif. Klasifikasikan berdasarkan kode HTTP.
+                code=gemini_res.status_code
+                issue={400:'Permintaan atau nama model ditolak. Periksa GEMINI_MODEL di Render.',
+                       401:'Kunci layanan analis ditolak. Buat kunci baru dan simpan di Render.',
+                       402:'Kredit layanan model tidak tersedia.',
+                       403:'Akses model atau API key ditolak. Periksa izin dan kunci di Google AI Studio.',
+                       404:'Model tidak ditemukan. Periksa nama GEMINI_MODEL di Render.',
+                       429:'Kuota layanan model sedang habis. Coba lagi setelah kuota tersedia.',
+                       500:'Layanan model sedang bermasalah.',
+                       503:'Layanan model sedang sibuk. Coba lagi nanti.'}.get(code,'Permintaan ke penyedia model gagal.')
+                return {'reply':baseline+'\n\nNARA: '+issue,
+                        'mode':'perlu pengecekan', 'error_code':'GEMINI_HTTP_'+str(code),
+                        'file':filename or None,'news_count':len(news)}
+
             candidates=gemini_res.json().get('candidates') or []
             answer='\n'.join(p.get('text','') for p in candidates[0].get('content',{}).get('parts',[]) if p.get('text')) if candidates else ''
             if not answer: raise ValueError('Model tidak mengembalikan teks yang dapat ditampilkan')
             return {'reply':answer,'mode':'Gemini terhubung','file':filename or None,'news_count':len(news)}
-        res=requests.post(api_url,headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
-                          json={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':user_content}],
-                                'temperature':0.2,'max_tokens':900},timeout=40)
+        res=await asyncio.to_thread(requests.post,api_url,
+                    headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
+                    json={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':user_content}],
+                          'temperature':0.2,'max_tokens':900},timeout=35)
         res.raise_for_status(); answer=res.json()['choices'][0]['message']['content']
         return {'reply':answer,'mode':'analis otomatis terhubung','file':filename or None,'news_count':len(news)}
+    except requests.Timeout:
+        return {'reply':baseline+'\n\nNARA: Koneksi penyedia model terlalu lama. Coba lagi beberapa saat.',
+                'mode':'waktu habis', 'error_code':'MODEL_TIMEOUT', 'file':filename or None,'news_count':len(news)}
+    except requests.RequestException:
+        return {'reply':baseline+'\n\nNARA: Penyedia model belum bisa dijangkau. Periksa status jaringan Render.',
+                'mode':'perlu pengecekan', 'error_code':'MODEL_CONNECTION', 'file':filename or None,'news_count':len(news)}
     except Exception:
-        return {'reply':baseline+'\n\nLayanan analisis lanjutan sedang tidak tersedia; ditampilkan ringkasan lokal saja.',
-                'mode':'fallback lokal','file':filename or None,'news_count':len(news)}
+        return {'reply':baseline+'\n\nNARA: Jawaban lanjutan belum berhasil diproses. Coba ulang atau periksa konfigurasi model.',
+                'mode':'perlu pengecekan', 'error_code':'MODEL_RESPONSE', 'file':filename or None,'news_count':len(news)}
 
 
 # ZERO QUANT v3: optional licensed OANDA candles or upload CSV. No broker order API.
