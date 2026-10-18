@@ -1,0 +1,18 @@
+{
+  "health": true,
+  "astro_BUY": true,
+  "signal_BUY": true,
+  "astro_SELL": true,
+  "signal_SELL": true,
+  "missing_date_422": true,
+  "invalid_timezone_400": true,
+  "no_live_price_fabrication": true,
+  "javascript_app.js": true,
+  "javascript_quant.js": true,
+  "javascript_hero3d.js": true,
+  "javascript_signal35.js": true,
+  "javascript_[[path]].js": true,
+  "HTML_ids": true,
+  "safe_key_handling": true,
+  "fullzip_integrity": true
+}
